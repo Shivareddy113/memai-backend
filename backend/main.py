@@ -42,6 +42,23 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------
+# ROOT & HEALTH CHECK ENDPOINTS
+# ------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "MemAI Backend API",
+        "version": "2.0.0",
+        "documentation": "/docs",
+        "health_check": "/api/health"
+    }
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "service": "MemAI", "model": MODEL_ID}
+
+# ------------------------------------------------------------
 # SQLITE SESSION & CONVERSATION DATABASE
 # ------------------------------------------------------------
 DB_FILE = "chat_history.db"
@@ -546,11 +563,6 @@ def delete_memory(memory_id: str):
         return {"status": "deleted", "memory_id": memory_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/health")
-def health_check():
-    return {"status": "ok", "service": "MemAI", "model": MODEL_ID}
 
 
 if __name__ == "__main__":
