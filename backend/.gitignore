@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+local_qdrant_db/
+chat_history.db
+.venv/
+venv/
