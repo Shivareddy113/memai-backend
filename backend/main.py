@@ -25,6 +25,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is missing! Please check your .env file or Render environment settings.")
 
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -107,7 +110,17 @@ def get_embedding(text: str) -> List[float]:
     embeddings = list(embedder.embed([text]))
     return embeddings[0].tolist()
 
-qdrant_client = QdrantClient(path="./local_qdrant_db")
+# Connect to Qdrant Cloud if credentials exist; otherwise fallback to local folder
+if QDRANT_URL and QDRANT_API_KEY:
+    logger.info(f"Connecting to remote Qdrant Cloud cluster: {QDRANT_URL}")
+    qdrant_client = QdrantClient(
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+    )
+else:
+    logger.info("Connecting to local embedded Qdrant database (./local_qdrant_db)")
+    qdrant_client = QdrantClient(path="./local_qdrant_db")
+
 COLLECTION_NAME = "user_memories"
 
 existing_cols = [c.name for c in qdrant_client.get_collections().collections]
