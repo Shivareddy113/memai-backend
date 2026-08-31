@@ -21,12 +21,12 @@ from fastembed import TextEmbedding
 # ------------------------------------------------------------
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY is missing! Please check your .env file or Render environment settings.")
 
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -66,8 +66,14 @@ def health_check():
 # ------------------------------------------------------------
 DB_FILE = "chat_history.db"
 
+def get_db_connection():
+    """Returns a SQLite connection with WAL mode and 30s busy timeout to prevent locks."""
+    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -269,12 +275,13 @@ def generate_session_title(first_message: str) -> str:
 def chat(payload: ChatRequest):
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
 
-        # 1. Ensure or create active session
+        # 1. Resolve Session ID & Title with short SQLite transaction
         session_id = payload.session_id
         session_title = "New Chat"
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
         if not session_id:
             session_id = f"sess_{uuid.uuid4().hex[:10]}"
@@ -295,6 +302,15 @@ def chat(payload: ChatRequest):
                     "INSERT INTO sessions (id, user_id, title, is_pinned, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
                     (session_id, payload.user_id, session_title, now_iso, now_iso),
                 )
+
+        # Retrieve recent conversation history for this session
+        cursor.execute(
+            "SELECT sender, text FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 10",
+            (session_id,),
+        )
+        past_msgs = cursor.fetchall()
+        conn.commit()
+        conn.close()  # Closed immediately so database is never held locked during LLM calls
 
         # 2. Retrieve global user memory from Qdrant
         query_vec = get_embedding(payload.message)
@@ -339,14 +355,7 @@ def chat(payload: ChatRequest):
             else "None recorded yet."
         )
 
-        # 3. Retrieve recent conversation history for this session
-        cursor.execute(
-            "SELECT sender, text FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 10",
-            (session_id,),
-        )
-        past_msgs = cursor.fetchall()
-
-        # Build prompt payload
+        # 3. Build prompt payload & generate LLM Completion
         messages_payload = [
             {
                 "role": "system",
@@ -371,7 +380,6 @@ Communication Guidelines:
 
         messages_payload.append({"role": "user", "content": payload.message})
 
-        # 4. LLM Completion
         completion = groq_client.chat.completions.create(
             model=MODEL_ID,
             messages=messages_payload,
@@ -380,13 +388,15 @@ Communication Guidelines:
         )
         ai_reply = completion.choices[0].message.content.strip()
 
-        # 5. Extract and save new facts
+        # 4. Extract and save new facts
         saved_facts = extract_and_save_facts(payload.user_id, payload.message)
 
-        # 6. Save message history to SQLite
+        # 5. Save message history to SQLite in a quick transaction
         user_msg_id = f"msg_{uuid.uuid4().hex[:10]}"
         ai_msg_id = f"msg_{uuid.uuid4().hex[:10]}"
 
+        conn = get_db_connection()
+        cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO messages (id, session_id, sender, text, recalled_memories, saved_memories, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (user_msg_id, session_id, "user", payload.message, json.dumps([]), json.dumps([]), now_iso),
@@ -395,7 +405,6 @@ Communication Guidelines:
             "INSERT INTO messages (id, session_id, sender, text, recalled_memories, saved_memories, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (ai_msg_id, session_id, "assistant", ai_reply, json.dumps(recalled_texts), json.dumps(saved_facts), now_iso),
         )
-
         conn.commit()
         conn.close()
 
@@ -417,7 +426,7 @@ Communication Guidelines:
 @app.get("/api/sessions/{user_id}", response_model=List[SessionItem])
 def get_user_sessions(user_id: str):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, user_id, title, is_pinned, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY is_pinned DESC, updated_at DESC",
@@ -446,7 +455,7 @@ def create_new_session(payload: CreateSessionRequest):
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         session_id = f"sess_{uuid.uuid4().hex[:10]}"
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO sessions (id, user_id, title, is_pinned, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
@@ -470,7 +479,7 @@ def create_new_session(payload: CreateSessionRequest):
 @app.get("/api/sessions/{session_id}/messages", response_model=List[MessageItem])
 def get_session_messages(session_id: str):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, session_id, sender, text, recalled_memories, saved_memories, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
@@ -498,7 +507,7 @@ def get_session_messages(session_id: str):
 @app.put("/api/sessions/{session_id}/pin")
 def toggle_pin(session_id: str, payload: UpdatePinRequest):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE sessions SET is_pinned = ? WHERE id = ?", (1 if payload.is_pinned else 0, session_id))
         conn.commit()
@@ -511,7 +520,7 @@ def toggle_pin(session_id: str, payload: UpdatePinRequest):
 @app.put("/api/sessions/{session_id}/title")
 def rename_session(session_id: str, payload: UpdateTitleRequest):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (payload.title, session_id))
         conn.commit()
@@ -524,7 +533,7 @@ def rename_session(session_id: str, payload: UpdateTitleRequest):
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
