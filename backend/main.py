@@ -136,6 +136,17 @@ if COLLECTION_NAME not in existing_cols:
         vectors_config=qmodels.VectorParams(size=384, distance=qmodels.Distance.COSINE),
     )
 
+# Create index for user_id so filtered memory queries execute on Qdrant Cloud
+try:
+    qdrant_client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="user_id",
+        field_schema=qmodels.PayloadSchemaType.KEYWORD,
+    )
+    logger.info("Payload index created for user_id field.")
+except Exception as e:
+    logger.info(f"Payload index on user_id status: {e}")
+
 # ------------------------------------------------------------
 # PYDANTIC SCHEMAS
 # ------------------------------------------------------------
@@ -310,7 +321,7 @@ def chat(payload: ChatRequest):
         )
         past_msgs = cursor.fetchall()
         conn.commit()
-        conn.close()  # Closed immediately so database is never held locked during LLM calls
+        conn.close()
 
         # 2. Retrieve global user memory from Qdrant
         query_vec = get_embedding(payload.message)
